@@ -1,0 +1,584 @@
+---
+title: "qualilty check"
+output:
+  pdf_document: default
+  html_document: default
+date: "2024-09-01"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/liyaqi/migration/')
+```
+# creating DESeq object
+```{r}
+order=c("A7",
+"A8",
+"A9",
+"A13",
+"A14",
+"A15",
+"A19",
+"A20",
+"A21",
+"A27",
+"A28",
+"A29",
+"Q69",
+"Q71",
+"Q72",
+"A1",
+"A2",
+"A3")
+```
+
+
+```{r}
+#install.packages("readxl")
+
+library(readxl)
+
+file='./All.counts.exp_anno.xlsx'
+count_mtx=read_excel(file,sheet='Sheet1')
+countdata=as.matrix(count_mtx[1:55487,order])
+rownames(countdata)=count_mtx$AccID
+colnames(countdata)=order
+
+colfile='./sampleGroup.xlsx'
+coldata=read_excel(colfile,sheet='Sheet1')
+coldata=as.data.frame(coldata)
+rownames(coldata)=coldata[,'sample']
+colnames(coldata)=c('case_control','group')
+coldata[,'case_control']=c(rep('control',3),rep('migration',12),rep('control',3))
+```
+```{r}
+coldata
+```
+
+
+```{r}
+coldata=coldata[order,c('group','case_control')]
+coldata$group=factor(coldata$group,levels=c('D2','D5','D9','D14','Insitu','Sham'))
+coldata$case_control=factor(coldata$case_control,levels=c('migration','control'))
+```
+
+```{r}
+countdata
+```
+```{r}
+all(rownames(coldata) %in% colnames(countdata))
+all(rownames(coldata) %in% colnames(countdata))
+```
+
+# dds is the DEseq object
+```{r}
+library(DESeq2)
+dds <- DESeqDataSetFromMatrix(countData =countdata,
+                              colData = coldata,
+                              #rowData=count_mtx[2:55487,c(1,20,21,22,23,24,25,26)],
+                              design= ~ case_control)
+# library(limma)
+# test=model.matrix(~sample+case_control, coldata)
+# test
+# is.fullrank(test)
+mcols(dds)=DataFrame(mcols(dds),count_mtx[,20:25])
+```
+
+# Pre-filtering 去掉全是0的gene
+```{r}
+dds <- dds[ rowSums(counts(dds)) > 1, ]
+rows=rowData(dds)
+length(unique(rows$GeneSymbol))
+length(rows$GeneSymbol)
+colData(dds)
+```
+# res=默认walds比较 case——control
+```{r}
+dds <- DESeq(dds)
+res <- results(dds,contrast=c("case_control","migration","control"))
+summary(res)
+```
+The results function automatically flags genes which contain a Cook’s distance above a cutoff for samples which have 3 or more replicates(outliers here in the summary table). The p values and adjusted p values for these genes are set to NA.
+
+# group with 3 levels at once，group组间差异，默认显示fold change显示假手术和D14差异(test only-skip)
+```{r}
+dds2 <- DESeqDataSetFromMatrix(countData = countdata,
+                              colData = coldata,
+                              design = ~ group)
+
+dds2 <- DESeq(dds2, test="LRT", reduced=~1)
+res2 <- results(dds2)
+res2
+```
+# transform dds
+```{r}
+vsd <- vst(dds, blind=FALSE)
+rld <- rlog(dds, blind=FALSE)
+```
+
+## 查看分布count
+```{r}
+meanSdPlot(assay(dds))
+```
+
+## 查看分布ntd
+```{r}
+# this gives log2(n + 1)
+ntd <- normTransform(dds)
+# BiocManager::install("vsn")
+library(vsn)
+meanSdPlot(assay(ntd))
+```
+##查看 vsd分布
+```{r}
+meanSdPlot(assay(vsd))
+```
+```{r}
+meanSdPlot(assay(rld))
+
+```
+#使用cooks distance检查样本 outlier(针对各个样本，每个基因count的分布形式的检查)，不明显有
+```{r}
+par(mar=c(8,5,2,2))
+boxplot(log10(assays(dds)[["cooks"]]), range=0, las=2)
+```
+
+## 检查过滤gene里的outlier
+low count(Deseq results中平均count小于3，我们标准更低为不全是0即可）
+```{r}
+# From the results() function to get the outlier genes
+m <- nrow(attr(dds, "dispModelMatrix"))
+p <- ncol(attr(dds, "dispModelMatrix"))
+cooksCutoff <- qf(0.99, p, m - p)
+cooksOutlier <- mcols(dds)$maxCooks > cooksCutoff
+
+w <- which(cooksOutlier)
+
+# that is the outliers, four as reported in the summary(res)
+ID=rownames(dds)[w]
+length(ID)
+```
+```{r}
+library("AnnotationDbi")
+library("org.Mm.eg.db")
+library("ggplot2")
+library("patchwork")
+genes=mapIds(org.Mm.eg.db, keys=as.vector(ID), column = "SYMBOL", keytype = "ENSEMBL",multiVals = 'first')
+plot.list=list()
+set.seed(123)
+IDlist=sample(1:length(ID),6,replace=F)
+
+for (i in seq(1,6)){
+num=IDlist[i]
+data <- plotCounts(ddsTC, ID[num],
+		     intgroup=c("case_control",'group'),returnData=TRUE)
+data$sample=rownames(data)
+plot.list[[i]]=ggplot(data, aes(x=group, y=count, color=group, group=case_control)) +
+geom_point() + stat_smooth(se=FALSE,method="loess") + scale_y_log10()+labs(y=genes[num])+
+  geom_text(aes(label = sample), vjust = 1.5, hjust = 0.5,size=2.5)
+}
+
+combined_plot <- wrap_plots(plot.list, ncol = 2)
+plot(combined_plot)
+```
+可见outlier gene基本在原位癌样本中。
+
+```{r}
+library("pheatmap")
+select <- order(rows[,'WaldPvalue_case_control_control_vs_migration'],
+                decreasing=FALSE)[1:20]
+
+select2=order(rowMeans(counts(dds[select,],normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+select=select[select2]
+df <- as.data.frame(colData(dds)[,c("group","case_control")])
+```
+
+
+```{r}
+plot_df=assay(ntd)[select,]
+rownames(plot_df)=rows$GeneSymbol[select]
+pheatmap(plot_df, cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df)
+```
+
+```{r}
+plot_df=assay(vsd)[select,]
+rownames(plot_df)=rows$GeneSymbol[select]
+pheatmap(plot_df, cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df)
+```
+
+
+```{r}
+plot_df=assay(rld)[select,]
+rownames(plot_df)=rows$GeneSymbol[select]
+pheatmap(plot_df, cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df)
+```
+
+
+```{r}
+sampleDists <- dist(t(assay(vsd)))
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$sample,vsd$group, vsd$case_control, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors,show_rownames = TRUE)
+
+```
+```{r}
+plotPCA(vsd, intgroup=c("group", "case_control"))
+help('plotPCA')
+```
+
+
+# group组间差异,ddsTC=design为group（同dds2），设置contrast为D9 vs sham
+```{r}
+head(colData(dds))
+colData(dds)=DataFrame(cbind(colData(dds),rownames(colData(dds))))
+colnames(colData(dds))[5]='sample'
+colData(dds)[,'sample']=factor(colData(dds)[,'sample'],level=order)
+ddsTC <- DESeqDataSet(dds, ~group)
+```
+## resTC 用LRT查看组间差异（同dds2），resTC_D9 walds查看D9比D2（group factor的排列方式决定LRT模式下有几种比较）
+```{r}
+ddsTC=DESeq(ddsTC, test="LRT", reduced = ~ 1)
+resultsNames(ddsTC)
+resTC=results(ddsTC)
+head(resTC)
+resTC_D9=results(ddsTC,name='group_D9_vs_D2',test='Wald')
+head(resTC_D9)
+resTC_D14=results(ddsTC,name='group_D14_vs_D2',test='Wald')
+```
+## resTC_D14中fold小于resTC_D9的，同时res_D9 paj和LRT paj都显著，可能满足类似macc1的变化
+```{r,echo = TRUE,message=TRUE}
+gene_trend=list()
+j=1
+library(progress)
+n <- length(rownames(resTC))
+
+# 创建一个进度条对象
+pb <- progress_bar$new(
+  format = "  处理进度 [:bar] :percent 完成 (:current/:total) 用时 :elapsed 秒 预估 :eta",
+  total = n, clear = FALSE, width = 60
+)
+for (gene in rownames(resTC)){
+  if (resTC_D14[gene,'log2FoldChange']<resTC_D9[gene,'log2FoldChange']){
+    if(sum(is.na(resTC_D9[gene,'padj']),is.na(resTC_D14[gene,'padj']))==0){
+    if (sum(resTC_D9[gene,'padj']<0.05,resTC_D14[gene,'padj']<0.05)==2){
+      gene_trend[j]=gene
+      j=j+1
+     }
+   }
+ }
+ pb$tick()
+}
+trend_index=as.vector(unlist(gene_trend))
+length(trend_index)
+trend_index_increase=trend_index[resTC_D9[trend_index,'log2FoldChange']>0]
+length(trend_index_increase)
+```
+## heatmap检查以上gene
+```{r}
+library("pheatmap")
+select <- order(resTC_D9[trend_index_increase,'padj'],
+                decreasing=FALSE)
+
+select2=order(rowMeans(counts(ddsTC[select,c('A19','A20','A21')],normalized=TRUE)),
+                decreasing=TRUE)
+select=select[select2]
+df <- as.data.frame(colData(ddsTC)[,c("group","case_control")])
+```
+
+
+```{r}
+plot_df=assay(vsd)[select,]
+rownames(plot_df)=rows$GeneSymbol[select]
+pheatmap(plot_df, cluster_rows=FALSE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df)
+```
+
+##按照resTC LRT padj画出前6的gene,D9>D2
+## heatmap检查以上gene
+```{r}
+library("pheatmap")
+increase_index=rownames(res)[resTC_D9[,'log2FoldChange']>0]
+select <- order(resTC[increase_index,'padj'],
+                decreasing=FALSE)[1:20]
+
+select2=order(rowMeans(counts(ddsTC[select,c('A19','A20','A21')],normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+select=select[select2]
+df <- as.data.frame(colData(ddsTC)[,c("group","case_control")])
+```
+
+
+```{r}
+plot_df=assay(vsd)[select,]
+rownames(plot_df)=rows$GeneSymbol[select]
+pheatmap(plot_df, cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df)
+```
+
+ 
+##按照resTC LRT padj画出前20的gene
+## heatmap检查以上gene
+```{r}
+library("pheatmap")
+select <- order(resTC[,'padj'],
+                decreasing=FALSE)[1:20]
+
+select2=order(rowMeans(counts(ddsTC[select,c('A19','A20','A21')],normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+select=select[select2]
+df <- as.data.frame(colData(ddsTC)[,c("group","case_control")])
+```
+
+
+```{r}
+plot_df=assay(vsd)[select,]
+rownames(plot_df)=rows$GeneSymbol[select]
+pheatmap(plot_df, cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df)
+```
+
+#plot 指定基因MACC1 count
+```{r}
+library("AnnotationDbi")
+library("org.Mm.eg.db")
+gene='Erbb4'
+ENSEMBLEID=mapIds(org.Mm.eg.db, keys=gene, keytype = "SYMBOL", column = "ENSEMBL",multiVals = 'first')
+ENSEMBLEID
+data <- plotCounts(ddsTC, ENSEMBLEID,
+		     intgroup=c("case_control",'group'),returnData=TRUE)
+data$sample=rownames(data)
+library(ggplot2)
+ggplot(data, aes(x=group, y=count, color=group, group=case_control)) +
+geom_point() + stat_smooth(se=FALSE,method="loess") + scale_y_log10()+labs(y=paste(gene,'_count',sep=''))+
+  geom_text(aes(label = sample), vjust = 1.5, hjust = 0.5,size=2.5)
+```
+## transform后
+```{r}
+transf=rld
+plot_data <- data.frame(
+  sample = colnames(assay(transf)),
+  expression = assay(transf)[ENSEMBLEID, ],
+  group = colData(transf)$group,
+  case_control=colData(transf)$case_control# 假设你有一个 condition 列
+)
+ggplot(plot_data, aes(x=group, y=expression, color=group, group=case_control)) +
+geom_point() + stat_smooth(se=FALSE,method="loess") + scale_y_log10()+labs(y=paste(gene,sep=''))
+```
+
+
+# 去掉Q69，再计算LRT，并导出新LRT 显著的 gene,和vsd transform的assay，mFuzz聚类表现
+```{r}
+dds_no_q69=ddsTC[, colnames(dds) != 'Q69']
+dds_no_q69=DESeq(dds_no_q69, test="LRT", reduced = ~ 1)
+resultsNames(dds_no_q69)
+resTC_no_q69=results(dds_no_q69)
+
+write.csv(resTC_no_q69,'./LRT_group_no_q69.csv')
+```
+
+
+```{r}
+vsd_no_q69=vst(dds_no_q69, blind=FALSE)
+mean_vsd_assay=t(apply(assay(vsd_no_q69), 1, function(x) tapply(x, colData(vsd_no_q69)$group, mean)))
+write.csv(mean_vsd_assay,'./mean_vsd_no_q69.csv')
+```
+
+
+```{r}
+library(performance)
+library(tidyverse)
+library(Seurat)
+library(readxl)
+library(rstatix)
+library(patchwork)
+library(fs)
+library(Mfuzz)
+library(RColorBrewer)
+library(Matrix)
+```
+
+# 从vsd的count matrix求均值，和注释matrix直接用于mfuzz
+```{r}
+#准备Mfuzz，assay行是基因，列是样本
+mean_vsd_mtx=read.csv('../mean_vsd_no_q69.csv')
+head(mean_vsd_mtx)
+rownames(mean_vsd_mtx)=mean_vsd_mtx$X
+mean_vsd_mtx=mean_vsd_mtx[,-1]
+##对于生物学重复直接求均值
+library('readxl')
+coldata=read_xlsx('../彭院课题组表达矩阵/sampleGroup.xlsx')
+coldata
+# 只保留LRT padj<0.05的gene
+res=read.csv('../LRT_group_no_q69.csv')
+select=!is.na(res$padj) & res$padj < 0.05
+head(select)
+
+head(mean_vsd_mtx)
+mean_vsd_mtx_raw=mean_vsd_mtx
+#选出LRT 显著的gene
+mean_vsd_mtx <- mean_vsd_mtx[select,]
+mean_vsd_mtx=as.matrix(mean_vsd_mtx)
+mean_vsd_mtx <- apply(mean_vsd_mtx,2,as.numeric)
+# 更换行名为基因
+rownames(mean_vsd_mtx)=rownames(mean_vsd_mtx_raw)[select]
+
+head(mean_vsd_mtx)
+
+mfuzz_class <- new('ExpressionSet',exprs = mean_vsd_mtx)
+#mfuzz_class <- filter.NA(mfuzz_class, thres = 0.2)
+mfuzz_class <- fill.NA(mfuzz_class, mode = 'mean')
+mfuzz_class@assayData$exprs
+mfuzz_class <- standardise(mfuzz_class)
+```
+
+```{r}
+set.seed(123)
+  cluster_num <- 15
+  mfrow <- c(3, 5)
+  mfuzz_cluster <- mfuzz(mfuzz_class, c = cluster_num, m = mestimate(mfuzz_class))
+  #pdf("./migration/mfuzz_test.pdf", width = 1800, height = 1600)
+  mfuzz.plot(mfuzz_class,
+             cl = mfuzz_cluster,
+             mfrow = mfrow ,
+             new.window = FALSE,
+             time.labels = colnames(mean_vsd_mtx))
+  #dev.off()
+clu <- mfuzz_cluster$cluster %>%as.data.frame()
+target_gene=rownames(mean_vsd_mtx_raw)[clu$.==12]
+write.csv(clu,"../migration/mfuzz_cluster_test.csv")
+```
+
+```{r}
+clu=read.csv('./mfuzz_cluster_test.csv')
+head(clu)
+cluster_name='15'
+ccluster=clu$.==cluster_name
+sum(cluster)
+#准备 GSEA使用D9 vs mean(control) 的log2FC, cluster15 用D5 / mean(control)
+length(mean_vsd_mtx[,1])
+length(clu[,1])
+mean_vsd_mtx=as.data.frame(mean_vsd_mtx)
+log2FC=mean_vsd_mtx %>%
+  mutate(mean_control = (Sham + Insitu) / 2,  # 计算平均值列
+         log2FC = log2(D5 / mean_control))%>%  # 生成结果列
+         select(log2FC)
+
+log2FC=data.frame(log2FC[cluster,],row.names = rownames(log2FC)[cluster])
+head(log2FC)
+colnames(log2FC)='log2FC'
+ENTRZID=mapIds(org.Mm.eg.db, keys=rownames(log2FC), keytype = "ENSEMBL", column = "ENTREZID",multiVals = 'first')
+
+log2FC$EZTRZID=ENTRZID
+head(log2FC)
+log2FC=na.omit(log2FC)
+log2FC$ENZEMBL=rownames(log2FC)
+
+##按照log2FC排序
+log2FC=log2FC[order(log2FC$log2FC,decreasing = T),]
+
+gene_list=log2FC$log2FC
+head(gene_list)
+
+names(gene_list)=log2FC$EZTRZID
+head(gene_list)
+```
+##GSEA of go kegg
+```{r}
+library(clusterProfiler)
+
+go_gse <- gseGO(geneList = gene_list,
+                  OrgDb = org.Mm.eg.db,
+                  ont = 'ALL',
+                  minGSSize    = 10,
+                  pvalueCutoff = 0.9,
+                  by='fgsea',
+                  verbose      = FALSE)
+
+c
+
+```
+```{r}
+go_gse@result
+```
+```{r}
+go=DOSE::setReadable(go_gse, OrgDb='org.Mm.eg.db',keyType='ENTREZID')
+tmp=go@result
+tmp
+write.csv(tmp,paste0('cluster_',cluster_name,'_GO.gsea.csv'))
+```
+## GSEA作图
+```{r}
+library(enrichplot)
+sortgo<-tmp[order(tmp$enrichmentScore, decreasing = T),]
+sortgo
+gseaplot2(go_gse, row.names(sortgo)[1:4],pvalue_table = TRUE)
+```
+```{r}
+dotplot(go,split=".sign")+facet_wrap(~.sign,scales="free")
+```
+```{r}
+##没有suppress？是的在cluster1里没有
+suppress_results <- as.data.frame(go) %>% filter(NES < 0)
+print(suppress_results)
+head(go)
+```
+
+```{r}
+down_go<-go[go$p.adjust<0.05 & go$enrichmentScore < -0.7,];down_go$group=-1
+up_go<-go[go$p.adjust<0.05 & go$enrichmentScore > 0.55,];up_go$group=1
+dat=rbind(up_go,down_go)
+colnames(dat)
+dat$pvalue = -log10(dat$pvalue)
+dat$pvalue=dat$pvalue*dat$group 
+dat=dat[order(dat$pvalue,decreasing = F),]
+dat
+```
+
+```{r}
+library(ggplot2)
+
+
+g_go <- ggplot(dat, aes(x = reorder(Description, order(pvalue, decreasing = F)), 
+                          y = pvalue, fill = group)) + 
+  geom_bar(stat = "identity") + 
+  scale_fill_gradient(low = "blue", high = "red", guide = FALSE) + 
+  scale_x_discrete(name = "Pathway names") +
+  scale_y_continuous(name = "log10P-value") +
+  coord_flip() + 
+  theme_bw()  +
+  ggtitle("Pathway Enrichment") + 
+  # 在条形图的右侧添加core gene标签
+  geom_text(aes(label = core_enrichment), 
+            position = position_dodge(width = 0.9))
+g_go
+```
+
+
+```{r}
+library(ggplot2)
+library(enrichplot)
+
+filtered_result <- as.data.frame(go) %>%
+  filter(NES > 0)
+
+# 重新创建 gseaResult 对象，包含过滤后的结果
+gsea_filtered <- go
+gsea_filtered@result <- filtered_result
+
+# 使用 cnetplot 只绘制 NES > 0 的结果
+cnetplot(gsea_filtered,showCategory= 2, foldChange= gene_list, colorEdge="TRUE")
+#colorEdge不同的term展示不同的颜色，如果希望标记节点的子集，可以使用node_label参数，它支持4种可能的选择(即“category”、“gene”、“all”和“none”).
+
+```
+
